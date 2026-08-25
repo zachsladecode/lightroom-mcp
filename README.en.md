@@ -1,300 +1,163 @@
-# Lightroom Classic MCP Server
+# Lightroom MCP + RAW Culling & Color Grading Skill v2
 
-Lets Claude (and other AI assistants) talk to your **Adobe Lightroom Classic** photo catalog. Search photos, set ratings, edit develop settings, manage collections, import/export — all by chatting.
+This fork combines Lightroom MCP with the complete `raw-photo-lightroom-preset` v2 skill in a single repository, covering:
 
-> **Preset round-trip fork (v0.10.0):** this branch adds exact preset inspection, historical-preset comparison, versioned checkpoint creation, safe preset export, and the complete `raw-photo-lightroom-preset` v2 Codex skill for RAW culling and iterative editing. See the [Traditional Chinese v2 guide](README.md) or open the [bundled skill](skills/raw-photo-lightroom-preset/SKILL.md).
+- RAW/JPG pairing and culling;
+- Grouping by lighting scenario;
+- Reading the actual settings of past Lightroom presets;
+- Small, incremental adjustments with preview output and comparison;
+- Creating preset checkpoints that never overwrite older versions;
+- Exporting Lightroom-generated preset files;
+- A safe XMP fallback for when MCP is unavailable.
 
-[![npm](https://img.shields.io/npm/v/@mskalski/lightroom-mcp.svg)](https://www.npmjs.com/package/@mskalski/lightroom-mcp)
-[![release](https://img.shields.io/github/v/release/Automaat/lightroom-mcp.svg)](https://github.com/Automaat/lightroom-mcp/releases/latest)
+The upstream project remains [`Automaat/lightroom-mcp`](https://github.com/Automaat/lightroom-mcp). Using a fork instead of an unrelated repository preserves the original commit history, the MIT license, and the ability to sync with upstream in the future; locally, it's recommended to keep `origin` pointing at this fork and `upstream` pointing at the original author.
 
-> **Works with:** Claude Desktop, Claude Code, Codex CLI, Cursor, Windsurf, VS Code.
-> **Needs:** Lightroom Classic on macOS or Windows. Nothing else — no programming required.
+## Repository contents
 
----
-
-## Install (Claude Desktop — easiest, 3 steps)
-
-This is the recommended path. Takes ~2 minutes, no terminal needed.
-
-### 1. Download the installer
-
-Go to the [latest release page](https://github.com/Automaat/lightroom-mcp/releases/latest) and download the file ending in **`.mcpb`** (it's near the top, called `lightroom-mcp-<version>.mcpb`).
-
-### 2. Double-click the downloaded file
-
-Claude Desktop opens automatically and asks: *"Install Lightroom Classic extension?"*. Click **Install**.
-
-> Don't have Claude Desktop yet? Get it free from [claude.com/download](https://claude.com/download). It runs on Mac and Windows.
-
-### 3. Turn on the plugin in Lightroom
-
-1. **Quit and reopen Lightroom Classic.** (The plugin needs a restart to show up.)
-2. In Lightroom, click **File** in the menu bar → **Plug-in Manager**.
-3. In the left list, click **Lightroom MCP**.
-4. On the right, click the **Start Server** button.
-5. You should see "Server running" appear. Done!
-
-### Try it
-
-Open Claude Desktop and type:
-
-> *List all my Lightroom collections.*
-
-Claude will list every collection in your catalog.
-
-Some other things to try:
-- *"Find all my 5-star photos from last summer."*
-- *"Add the keyword 'portfolio' to the photos I have selected in Lightroom."*
-- *"Apply the 'Vivid' develop preset to these photos."*
-- *"Compare my approved 'John Warm v3' preset with the current candidate."*
-- *"Create a versioned preset checkpoint from this representative photo and export it."*
-- *"Export the selected photos to my Desktop as JPEGs at 2000px wide."*
-
----
-
-## Install (other AI tools)
-
-Already using Claude Code, Codex, Cursor, Windsurf, or VS Code? Pick your tool below. **All paths still end with the Lightroom step from the section above** — restart Lightroom and click **Start Server** in Plug-in Manager.
-
-<details>
-<summary><b>Claude Code</b></summary>
-
-Same `.mcpb` file as Claude Desktop above — Claude Code accepts it too. Or install via the CLI:
-
-```bash
-claude mcp add lightroom -- npx -y @mskalski/lightroom-mcp
+```text
+plugin/LightroomMCP.lrplugin/       Lightroom Classic Lua plugin
+server/                             MCP server and tool contracts
+skills/raw-photo-lightroom-preset/ Complete v2 Codex skill
+tests/e2e/                          Real-Lightroom verification flow
 ```
 
-</details>
+The skill directory contains `SKILL.md`, UI metadata, reference docs for culling/grading/MCP, style data, an XMP generator and its tests; it does not contain user photos, catalogs, tokens, or local absolute paths.
 
-<details>
-<summary><b>Codex CLI</b></summary>
+## v2 culling workflow
 
-```bash
-codex mcp add lightroom -- npx -y @mskalski/lightroom-mcp
+### 1. Establish source relationships first
+
+Record, for each RAW/preview pair, at minimum the relative path, filename stem, capture time, camera, dimensions, and how the preview was generated. Different folders may share the same filename, so pairing cannot rely on basename alone; items that are missing or conflicting are marked `unclassified` and do not inherit the color conclusions of other JPGs.
+
+Ordinary camera JPGs can be used to judge composition, focus, and expression first; final exposure, white balance, color, and preset direction must be judged from the RAW render in Lightroom/Camera Raw.
+
+### 2. Track three states separately
+
+| Field | Allowed values | Purpose |
+|---|---|---|
+| `selection_status` | `delivery candidate`, `keep`, `reject`, `pending review` | Composition, focus, expression, and delivery value |
+| `edit_status` | `RAW pending review`, `light global adjustment`, `needs local adjustment`, `unknown` | Post-processing workload |
+| `style_status` | `classified`, `unclassified` | Whether a reliable color direction has been found |
+| `confidence` | `high`, `medium`, `low` | Confidence in the judgment |
+
+Do not map these states to Lightroom star ratings or color labels on your own. If a mapping is needed, have the user define it explicitly first, then treat the mapping as a separate field.
+
+### 3. Group by lighting and purpose
+
+Do not force a single preset onto an entire event. Common groupings include outdoor shade, indoor warm/mixed light, stage lighting, backlight, and high ISO. Pick one representative RAW per group first, and keep difficult outliers separate.
+
+Recommended fields for a culling deliverable:
+
+```text
+relative_raw_path, relative_preview_path, selection_status, edit_status,
+style_status, lighting_cluster, confidence, notes
 ```
 
-The Lightroom plugin installs itself the first time Codex talks to the server.
+## Historical color-grading iteration workflow
 
-</details>
+1. Pick a representative RAW or virtual copy that won't damage the master edit.
+2. Read the current metadata/Develop settings and output a baseline JPEG.
+3. Use `get_develop_preset` to read an approved historical preset; disambiguate same-named presets by UUID or folder/scope.
+4. Make only one small change at a time: technical correction, tonal shape, color correction, creative style, or detail/noise reduction.
+5. After each step, export a new preview from Lightroom and actually compare it — don't guess a batch of slider values at once.
+6. Use `create_develop_preset` to create a unique, versioned plugin checkpoint.
+7. Use `compare_develop_presets` to diff the historical version against the candidate version and keep a record of the setting differences.
+8. Only after the representative photo is confirmed, copy the settings to the rest of the same lighting group using an explicit field list.
+9. Use `export_develop_preset` to export the accepted checkpoint; if the destination file already exists, the tool refuses to overwrite it.
+10. Only claim the preset is compatible and the visual result is correct after importing and checking it in the target Lightroom version.
 
-<details>
-<summary><b>Cursor / Windsurf / VS Code (Continue, Cline, Roo, ...)</b></summary>
+## New MCP tools added in v0.10.0
 
-Open your client's MCP settings and add:
+| Tool | Function |
+|---|---|
+| `get_develop_preset` | Reads the UUID, source file, and complete serializable settings of one exact preset |
+| `compare_develop_presets` | Produces a setting-by-setting diff between a base and a candidate |
+| `create_develop_preset` | Creates a versioned checkpoint from selected fields on a representative photo |
+| `export_develop_preset` | Copies a Lightroom preset's backing file, never overwriting an existing one |
 
-```json
-{
-  "mcpServers": {
-    "lightroom": {
-      "command": "npx",
-      "args": ["-y", "@mskalski/lightroom-mcp"]
-    }
-  }
-}
+The existing `list_develop_presets` and `apply_develop_preset` also support UUID, folder, and scope; `set_develop_settings`, `copy_develop_settings`, and checkpoint creation support the main tone curve as well as RGB point-curve arrays.
+
+Plugin-managed checkpoints created via the Adobe SDK do not appear in the Develop panel. They can still be listed, applied, and exported via MCP; if you need a formal preset that's visible in the panel, export it and import it through the Lightroom UI, or use Create Preset inside Lightroom.
+
+## Windows installation
+
+### 1. Build this fork
+
+```powershell
+git clone https://github.com/John-owo/lightroom-mcp.git
+Set-Location .\lightroom-mcp
+git switch feat/preset-roundtrip
+Set-Location .\server
+npm ci
+npm run build
+Set-Location ..
 ```
 
-The plugin installs itself the first time your client starts the server. If your client only starts the server on first tool call, you can install the plugin upfront:
+### 2. Install the Lightroom plugin
 
-```bash
-npx -y @mskalski/lightroom-mcp install-plugin
+```powershell
+node .\server\dist\index.js install-plugin
 ```
 
-</details>
+Fully quit and reopen Lightroom Classic, then start the server from **File → Plug-in Manager → Lightroom MCP**.
 
-<details>
-<summary><b>No Node.js installed? Use the standalone binary</b></summary>
+### 3. Configure Codex MCP
 
-1. Download the right file from the [latest release](https://github.com/Automaat/lightroom-mcp/releases/latest):
-   - **Mac (Apple Silicon, M1/M2/M3/M4):** `lightroom-mcp-darwin-arm64`
-   - **Mac (Intel):** `lightroom-mcp-darwin-x64`
-   - **Windows:** `lightroom-mcp-windows-x64.exe`
+Add the locally built `server/dist/index.js` to your Codex configuration; replace the path below with your actual clone location:
 
-2. **macOS only** — make it runnable and bypass Gatekeeper (the binary isn't signed):
-   ```bash
-   chmod +x ~/Downloads/lightroom-mcp-darwin-arm64
-   xattr -d com.apple.quarantine ~/Downloads/lightroom-mcp-darwin-arm64
-   ```
-
-3. Install the Lightroom plugin:
-   ```bash
-   ~/Downloads/lightroom-mcp-darwin-arm64 install-plugin
-   ```
-
-4. Point your AI tool at the binary's full path. Example for Codex:
-   ```bash
-   codex mcp add lightroom -- /Users/you/Downloads/lightroom-mcp-darwin-arm64
-   ```
-
-</details>
-
-<details>
-<summary><b>Install the Lightroom plugin manually (any client)</b></summary>
-
-If you'd rather drop the plugin in by hand:
-
-1. Download the matching zip from the [latest release](https://github.com/Automaat/lightroom-mcp/releases/latest):
-   - Mac: `LightroomMCP-macos.lrplugin.zip`
-   - Windows: `LightroomMCP-windows.lrplugin.zip`
-2. Unzip it. You get a folder called `LightroomMCP.lrplugin`.
-3. Move that folder into Lightroom's Modules folder:
-   - **Mac:** `~/Library/Application Support/Adobe/Lightroom/Modules/`
-   - **Windows:** `%APPDATA%\Adobe\Lightroom\Modules\`
-   - (If the `Modules` folder doesn't exist, create it.)
-4. Restart Lightroom → **Plug-in Manager** → **Start Server**.
-
-</details>
-
----
-
-## Something not working?
-
-1. Open Lightroom → **File → Plug-in Manager → Lightroom MCP → Show Status**. Both sockets should say `connected: true`. If not, click **Start Server**.
-2. Make sure you **fully quit and reopened Lightroom** after install (Cmd+Q on Mac, Alt+F4 on Windows). "Reload Plug-in" alone is not enough.
-3. See [Troubleshooting](#troubleshooting) below for specific errors.
-
-## Tools
-
-| Tool | What it does |
-| --- | --- |
-| `search_photos` | Search by filename / keywords / rating / date range. |
-| `get_selected_photos` | Photos selected in Lightroom (or filmstrip). |
-| `get_photo_metadata` | EXIF, GPS, IPTC location, copyright + develop settings for one photo. |
-| `list_collections` | All collections and collection sets. |
-| `create_collection` | New collection (optional parent set). |
-| `add_to_collection` | Add photos to a named collection. |
-| `set_keywords` | Add or remove keywords on photos. |
-| `set_rating` | Set 0-5 star rating on photos. |
-| `import_photos` | Import a file or folder into the catalog. |
-| `export_photos` | Export with format / quality / dimensions. |
-| `list_develop_presets` | Discover Lightroom-visible presets and plugin checkpoints. |
-| `get_develop_preset` | Read settings and backing-file metadata for one exact preset. |
-| `compare_develop_presets` | Diff an approved historical preset against a candidate. |
-| `create_develop_preset` | Capture explicit settings from a photo as a versioned plugin checkpoint. |
-| `export_develop_preset` | Copy a custom/checkpoint preset backing file without overwriting. |
-| `apply_develop_preset` | Apply an exact preset by UUID or disambiguated name. |
-| `copy_develop_settings` | Copy develop settings between photos. |
-| `set_develop_settings` | Write SDK setting key/values directly. |
-
-Full schemas and parameter docs: [`server/src/list-tools-handler.ts`](server/src/list-tools-handler.ts).
-
-### Iterative preset workflow
-
-Use a representative photo or virtual copy rather than a master edit:
-
-1. Read an approved historical preset with `get_develop_preset`.
-2. Apply bounded setting changes to the representative and export a Lightroom-rendered JPEG.
-3. Create a uniquely named checkpoint such as `John Warm v4` with `create_develop_preset`.
-4. Compare it with the approved preset using `compare_develop_presets`.
-5. Repeat the render/inspect cycle; export the accepted checkpoint with `export_develop_preset`.
-
-`create_develop_preset` uses Adobe's plugin preset API. These checkpoints are intentionally hidden from the Develop panel and are listed with `scope: "plugin"`. They are versioned instead of overwritten. `export_develop_preset` refuses existing destinations and preserves the backing file format Lightroom supplies. Built-in presets without a backing file cannot be exported.
-
-### Point curves
-
-`set_develop_settings` accepts Lightroom's composite and per-channel point curve
-keys: `ToneCurvePV2012`, `ToneCurvePV2012Red`, `ToneCurvePV2012Green`, and
-`ToneCurvePV2012Blue`. Each value is a flat list of 2 to 32 input/output pairs.
-Values are integers from 0 to 255, inputs must be strictly increasing, and each
-curve must start at input 0 and end at input 255.
-
-```json
-{
-  "photo_id": "283615",
-  "settings": {
-    "ToneCurveName2012": "Custom",
-    "ToneCurvePV2012": [0, 0, 40, 25, 128, 132, 220, 240, 255, 250],
-    "ToneCurvePV2012Blue": [0, 0, 64, 58, 192, 198, 255, 255]
-  }
-}
+```toml
+[mcp_servers.lightroom]
+command = 'C:\Program Files\nodejs\node.exe'
+args = ['D:\path\to\lightroom-mcp\server\dist\index.js']
+startup_timeout_sec = 60
 ```
 
-## How it works
+Restart Codex so new tasks load the 18 tools.
 
-```
-┌─────────────┐    stdio    ┌──────────────────┐  TCP :58763 →   ┌──────────────────┐
-│  AI client  │ ◄─────────► │   MCP server     │ ──────────────► │ Lightroom plugin │
-│ (Claude/    │             │  (Node TCP)      │ ←────────────── │   (LrSocket)     │
-│  Codex/...) │             └──────────────────┘   ← TCP :58764  └──────────────────┘
-└─────────────┘                                                           │
-                                                                          ▼
-                                                                catalog:withReadAccessDo
-```
+### 4. Install the v2 skill
 
-Plugin binds two `LrSocket` servers on localhost (`58763` request, `58764` response). Server connects as TCP client. Frame: line-delimited JSON, `\n` terminator. Auto-reconnect on both sides. Same dual-port pattern as MIDI2LR.
+If you already have a skill with the same name, back it up first. Then, from the repository root:
 
-## CLI reference
-
-```
-lightroom-mcp [stdio]            Run MCP over stdio (default)
-lightroom-mcp install-plugin     Copy bundled plugin into Lightroom Modules folder
-lightroom-mcp --help | --version
+```powershell
+$skillSource = Resolve-Path '.\skills\raw-photo-lightroom-preset'
+$skillTarget = Join-Path $env:USERPROFILE '.codex\skills\raw-photo-lightroom-preset'
+New-Item -ItemType Directory -Path $skillTarget -Force | Out-Null
+Copy-Item -Path "$skillSource\*" -Destination $skillTarget -Recurse -Force
 ```
 
-Env vars:
+After restarting Codex, you can use:
 
-| Var | Default | Purpose |
-| --- | --- | --- |
-| `LIGHTROOM_MCP_REQUEST_PORT` | `58763` | Plugin request port. |
-| `LIGHTROOM_MCP_RESPONSE_PORT` | `58764` | Plugin response port. |
-| `LIGHTROOM_MCP_TOKEN_PATH` | `~/.config/lightroom-mcp/token` | Auth token file. |
-
-If you change ports on the server side, change them in **Plug-in Manager → Lightroom MCP** to match.
-
-## Security
-
-The plugin generates a 256-bit token in `~/.config/lightroom-mcp/token` on **Start Server**. The MCP server attaches it to every request. Localhost-only — no remote attack surface.
-
-## Develop
-
-```bash
-mise install                        # tools (node, bun, lua + luarocks, selene)
-mise run install                    # npm ci
-mise run build                      # tsc
-mise run test                       # jest
-mise run mcpb                       # build .mcpb bundle
-mise run binary                     # build single-file binaries via Bun
-mise run lua:lint                   # selene-lint the Lua plugin
-mise run lua:test                   # busted specs for the Lua plugin
+```text
+Use $raw-photo-lightroom-preset to help me cull this batch of RAWs, first splitting
+delivery candidates from pending review, then grouping by lighting. Read my approved
+historical presets, make only small adjustments on representative photos, output a
+comparison each round, and create versioned checkpoints that never overwrite.
 ```
 
-Repo layout:
+## Safety boundaries
 
-- `server/` — TypeScript MCP server (ESM, NodeNext).
-- `plugin/LightroomMCP.lrplugin/` — Lua plugin loaded by Lightroom Classic.
-- `mcpb/manifest.json` — `.mcpb` bundle manifest.
-- `scripts/build-mcpb.mjs` — pack the .mcpb.
-- `scripts/build-binary.mjs` — Bun `--compile` per-target binaries.
-- `manual-test.mjs` — direct TCP probe (bypasses MCP).
+- Never move, rename, delete, or overwrite original photos.
+- Never test on an unapproved master edit.
+- Never declare color or a preset "done" based on camera JPGs alone.
+- Never silently copy crop, white balance, profile, lens, or detail settings across a whole batch.
+- MCP has no virtual copies, snapshots, undo, or full local tools; when masking, healing, AI Denoise, Calibration, Color Grading, or Point Color is needed, hand it back to Lightroom to finish manually.
+- The backing format of an MCP checkpoint is determined by Lightroom; a built-in preset with no backing file cannot be exported.
 
-## Adding a new tool
+## Verified scope
 
-1. Add a new `Handler*.lua` under `plugin/LightroomMCP.lrplugin/`.
-2. Register it in the `DISPATCH` table in `PluginInfoProvider.lua`.
-3. Add a contract entry in `server/src/tool-contracts.ts`.
-4. Declare any new LR globals in `lightroom.yml` (selene std).
+- TypeScript: 13 suites, 160 tests passing.
+- Lua `HandlerDevelop`: 28 behavior tests passing; Selene reports 0 errors / 0 warnings / 0 parse errors.
+- Real Lightroom Classic: creating a checkpoint, reading it back exactly, exporting a `.lrtemplate`, and rejecting a duplicate export while leaving the original file's hash unchanged — 5/5 passing.
+- XMP fallback generator: 14 tests passing, with extension, sidecar, overwrite, atomic-write, schema, and range protections.
 
-## Troubleshooting
+Real-machine testing did not re-import an exported `.lrtemplate` through the Lightroom UI, so "target-Lightroom import compatibility" and "visual style correctness" are not listed as passed — those must be confirmed with real photos and user sign-off.
 
-- **`failed to open localhost:58763` after Reload Plug-in** — old async task still owns the port. Quit Lightroom (Cmd+Q on macOS / Alt+F4 on Windows) and reopen.
-- **Plugin not connected** — the server now self-restarts after a Reload Plug-in that tore down a running instance. If it's still stopped, click **Start Server** in Plug-in Manager; it reconnects within ~1s.
-- **Lightroom hangs on "performing shutdown tasks" when quitting** — the plugin now stops its background loop and drops both sockets as soon as Lightroom starts to quit, instead of reconnecting or waiting out a pending response. A handler that is already running (a large search, export, import, or preset apply) must still finish before Lightroom can quit.
-- **Timeout errors** — handler may be scanning a large catalog without filters; add `rating`, `filename`, `keywords`, or date filters to narrow.
-- **macOS "cannot be opened because the developer cannot be verified"** (binary path) — `xattr -d com.apple.quarantine /path/to/binary`. Or right-click → Open the first time.
-- **Windows SmartScreen blocks the .exe** — More info → Run anyway.
+## Further documentation
 
-Logs:
+- [v2 skill main flow](skills/raw-photo-lightroom-preset/SKILL.md)
+- [Culling, grouping, and the five-stage grading process](skills/raw-photo-lightroom-preset/references/workflow.md)
+- [Style library](skills/raw-photo-lightroom-preset/references/style-library.md)
+- [Lightroom MCP boundaries and closed loop](skills/raw-photo-lightroom-preset/references/lightroom-mcp.md)
+- [Traditional Chinese README](README.md)
 
-| Component | macOS | Windows |
-| --- | --- | --- |
-| Plugin | `~/Documents/LrClassicLogs/LightroomMCP.log` | `%USERPROFILE%\Documents\LrClassicLogs\LightroomMCP.log` |
-| Claude Desktop | `~/Library/Logs/Claude/mcp*.log` | `%APPDATA%\Claude\Logs\mcp*.log` |
-
-The plugin resolves its log path via the OS (`LrPathUtils`), so on Windows with
-OneDrive-redirected Documents the file follows the redirect. The exact resolved
-path is shown as **Log file:** in Plug-in Manager → **Show Status** — use that if
-the table path above is empty.
-
-## License
-
-MIT
+Licensed under the repository's [MIT License](LICENSE).
