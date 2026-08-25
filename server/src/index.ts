@@ -68,11 +68,21 @@ async function main() {
     process.exit(1);
   }
 
+  // Do NOT exit on lock contention here: the MCP stdio handshake below must
+  // always succeed, even when another live instance already owns the plugin
+  // sockets. Claude Code/Cowork's shared MCP pool spins up a disposable
+  // sibling process just to negotiate protocol version before handing off to
+  // the real session; if that sibling hits process.exit(1) before
+  // server.connect(transport), the pool sees the connection close mid
+  // handshake and can never load this server's tools (even though the "real"
+  // instance is running fine). So on conflict, skip owning the plugin sockets
+  // and surface the conflict through isReady()/notReadyMessage instead.
+  let lockConflictMessage: string | null = null;
   try {
     acquireInstanceLock(REQUEST_PORT, RESPONSE_PORT);
   } catch (err) {
-    console.error((err as Error).message);
-    process.exit(1);
+    lockConflictMessage = (err as Error).message;
+    console.error(lockConflictMessage);
   }
 
   ensurePluginInstalled(here, (m) => console.error(m));
@@ -117,13 +127,19 @@ async function main() {
       stopResponseSocket();
     },
   });
-  requestSocket.connect();
-
-  startHeartbeat(dispatcher, HEARTBEAT_INTERVAL_MS);
+  if (lockConflictMessage === null) {
+    requestSocket.connect();
+    startHeartbeat(dispatcher, HEARTBEAT_INTERVAL_MS);
+  }
 
   const server = createMcpServer({
     dispatcher,
-    isReady: () => requestSocket.isConnected() && (responseSocket?.isConnected() ?? false),
+    isReady: () =>
+      lockConflictMessage === null &&
+      requestSocket.isConnected() &&
+      (responseSocket?.isConnected() ?? false),
+    notReadyMessage:
+      lockConflictMessage !== null ? () => lockConflictMessage as string : undefined,
   });
 
   const transport = new StdioServerTransport();

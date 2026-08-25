@@ -1,7 +1,11 @@
 import { describe, it, expect, afterEach } from '@jest/globals';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createMcpServer } from '../src/create-server.js';
+import { acquireInstanceLock, type InstanceLock } from '../src/instance-lock.js';
 import type { PluginResponse } from '../src/dispatcher.js';
 
 interface ToolResult {
@@ -20,9 +24,12 @@ interface Pair {
   client: Client;
 }
 
-async function connect(opts: { ready?: boolean; call?: CallFn } = {}): Promise<Pair> {
+async function connect(
+  opts: { ready?: boolean; notReadyMessage?: () => string; call?: CallFn } = {},
+): Promise<Pair> {
   const server = createMcpServer({
     isReady: () => opts.ready ?? true,
+    notReadyMessage: opts.notReadyMessage,
     dispatcher: {
       call: opts.call ?? (async () => ({ id: 'x', result: null })),
     },
@@ -155,6 +162,49 @@ describe('createMcpServer', () => {
       const result = asToolResult(await pair.client.callTool({ name: 'list_collections', arguments: {} }));
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toBe('raw string error');
+    });
+  });
+
+  describe('CallTool — instance lock conflict', () => {
+    // Regression for the version-negotiation failure this server hits inside
+    // Claude Code/Cowork's shared MCP pool: a disposable sibling process is
+    // spun up to complete the MCP handshake while a live instance already
+    // holds the plugin-socket lock. The handshake (list_tools/call_tool) must
+    // still succeed here even though the lock itself could not be acquired.
+    let tmpDir: string | null = null;
+    let heldLock: InstanceLock | null = null;
+
+    afterEach(() => {
+      heldLock?.release();
+      heldLock = null;
+      if (tmpDir) {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+        tmpDir = null;
+      }
+    });
+
+    it('completes the handshake and reports the lock conflict instead of crashing', async () => {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lightroom-mcp-server-lock-test-'));
+      heldLock = acquireInstanceLock(58763, 58764, tmpDir);
+
+      let conflictMessage: string;
+      try {
+        acquireInstanceLock(58763, 58764, tmpDir);
+        throw new Error('expected acquireInstanceLock to throw on conflict');
+      } catch (err) {
+        conflictMessage = (err as Error).message;
+      }
+      expect(conflictMessage).toMatch(/Another Lightroom MCP bridge is already running/);
+
+      pair = await connect({ ready: false, notReadyMessage: () => conflictMessage });
+
+      const { tools } = await pair.client.listTools();
+      expect(tools.length).toBeGreaterThan(0);
+
+      const result = asToolResult(await pair.client.callTool({ name: 'list_collections', arguments: {} }));
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toBe(conflictMessage);
+      expect(result.content[0].text).not.toMatch(/not connected/i);
     });
   });
 });
