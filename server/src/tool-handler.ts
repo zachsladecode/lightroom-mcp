@@ -3,6 +3,12 @@ import type { Dispatcher } from "./dispatcher.js";
 export interface ToolHandlerDeps {
   dispatcher: Pick<Dispatcher, "call">;
   isReady: () => boolean;
+  /**
+   * Overrides NOT_CONNECTED_MESSAGE when not-ready has a more specific cause
+   * (e.g. another bridge instance owns the plugin connection) that the user
+   * needs to see instead of the generic "plugin not connected" text.
+   */
+  notReadyMessage?: () => string;
 }
 
 export interface ToolResponse {
@@ -18,7 +24,7 @@ export function createCallToolHandler(deps: ToolHandlerDeps) {
   return async (name: string, args: unknown): Promise<ToolResponse> => {
     if (!deps.isReady()) {
       return {
-        content: [{ type: "text", text: NOT_CONNECTED_MESSAGE }],
+        content: [{ type: "text", text: deps.notReadyMessage?.() ?? NOT_CONNECTED_MESSAGE }],
         isError: true,
       };
     }

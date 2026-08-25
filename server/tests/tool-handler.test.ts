@@ -5,10 +5,12 @@ import type { PluginResponse } from '../src/dispatcher.js';
 
 function makeHandler(opts: {
   ready?: boolean;
+  notReadyMessage?: () => string;
   call?: (action: string, params: unknown) => Promise<PluginResponse>;
 } = {}) {
   return createCallToolHandler({
     isReady: () => opts.ready ?? true,
+    notReadyMessage: opts.notReadyMessage,
     dispatcher: {
       call: opts.call ?? (async () => ({ id: 'x', result: null })),
     },
@@ -21,6 +23,18 @@ describe('createCallToolHandler', () => {
     const result = await handler('list_collections', {});
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toMatch(/not connected/i);
+  });
+
+  it('uses the custom notReadyMessage when provided instead of the generic message', async () => {
+    const handler = makeHandler({
+      ready: false,
+      notReadyMessage: () => 'Another Lightroom MCP bridge instance owns the plugin connection (pid 4242)',
+    });
+    const result = await handler('list_collections', {});
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toBe(
+      'Another Lightroom MCP bridge instance owns the plugin connection (pid 4242)',
+    );
   });
 
   it('forwards action and args to dispatcher', async () => {
