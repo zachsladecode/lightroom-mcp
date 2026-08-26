@@ -22,6 +22,29 @@ Plugin opens **two LrSocket binds** as servers; MCP server connects to both.
 
 Pattern verified against MIDI2LR (`rsjaffe/MIDI2LR`, see `src/plugin/Client.lua`) — same dual-port LrSocket model, ports 58763/58764 also chosen there.
 
+### Multiple bridge processes on one machine
+
+The plugin accepts **one client per port** (see above), but nothing stops
+multiple MCP hosts on the same Mac from each spawning their own
+`lightroom-mcp` process against the same default ports — Claude Desktop's own
+MCP client, a separate Claude Code/Cowork session's `mcp__remote-devices__`
+proxy, another local Claude Code CLI session, etc. `server/src/bridge-coordinator.ts`
+resolves this: exactly one process per port pair becomes **primary** (it owns
+the real `PluginSocket` connections and the `server/src/instance-lock.ts` pid
+lock); every other process attaches as a **secondary** over a local Unix
+domain socket / Windows named pipe (`server/src/ipc-server.ts` +
+`ipc-client.ts`, address from `bridge-paths.ts`) and forwards its MCP tool
+calls through the primary instead of contending for the plugin sockets
+directly. `server/src/liveness.ts` adds a heartbeat file the primary rewrites
+periodically, so a would-be secondary can tell "pid exists" (instance-lock's
+`kill(pid, 0)`, which survives pid reuse and hangs) apart from "actually
+answering" (an IPC handshake) apart from "genuinely dead" (stale pid, or a
+live-but-unresponsive pid whose heartbeat has also gone stale) before ever
+reclaiming a lock. If the primary dies, every attached secondary detects the
+dropped IPC connection and immediately re-resolves a role — one of them
+becomes the new primary, no human has to go hunt down and kill a pid. See the
+module doc comment in `bridge-coordinator.ts` for the full state machine.
+
 ## Commands
 
 Use mise tasks from repo root:

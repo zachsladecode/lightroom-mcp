@@ -11,7 +11,7 @@ import { createMcpServer } from "./create-server.js";
 import { parseCli, helpText } from "./cli.js";
 import { VERSION } from "./version.js";
 import { startHeartbeat } from "./heartbeat.js";
-import { acquireInstanceLock } from "./instance-lock.js";
+import { BridgeCoordinator, type PrimaryHandles } from "./bridge-coordinator.js";
 import {
   ensurePluginInstalled,
   findBundledPlugin,
@@ -35,6 +35,73 @@ const ACTION_TIMEOUTS_MS: Record<string, number> = {
 };
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+
+/**
+ * Wires the real TCP connection to the plugin's request/response ports.
+ * Only ever invoked by BridgeCoordinator, and only once this process has
+ * actually won the "primary" role for these ports -- the plugin accepts
+ * exactly one client per port, so nothing else may call this. See
+ * bridge-coordinator.ts for how every other lightroom-mcp process on this
+ * machine instead attaches to whichever process did win, over local IPC.
+ */
+function startPrimaryHandles(requestPortNum: number, responsePortNum: number): PrimaryHandles {
+  let requestSocket: PluginSocket;
+  let responseSocket: PluginSocket | null = null;
+  let responseConnectTimer: NodeJS.Timeout | null = null;
+
+  const dispatcher = new Dispatcher({
+    send: (line) => requestSocket.send(line),
+    getToken: () => readToken(),
+    timeoutMs: REQUEST_TIMEOUT_MS,
+    actionTimeoutsMs: ACTION_TIMEOUTS_MS,
+  });
+
+  const startResponseSocket = () => {
+    if (responseSocket || !requestSocket.isConnected()) return;
+    responseSocket = new PluginSocket({
+      port: responsePortNum,
+      label: "response",
+      onLine: (line) => dispatcher.handleResponseLine(line),
+    });
+    responseSocket.connect();
+  };
+  const stopResponseSocket = () => {
+    if (responseConnectTimer) {
+      clearTimeout(responseConnectTimer);
+      responseConnectTimer = null;
+    }
+    responseSocket?.stop();
+    responseSocket = null;
+  };
+
+  requestSocket = new PluginSocket({
+    port: requestPortNum,
+    label: "request",
+    onConnect: () => {
+      if (responseConnectTimer) clearTimeout(responseConnectTimer);
+      responseConnectTimer = setTimeout(() => {
+        responseConnectTimer = null;
+        startResponseSocket();
+      }, RESPONSE_CONNECT_SETTLE_MS);
+    },
+    onDisconnect: () => {
+      stopResponseSocket();
+    },
+  });
+
+  requestSocket.connect();
+  const heartbeatTimer = startHeartbeat(dispatcher, HEARTBEAT_INTERVAL_MS);
+
+  return {
+    dispatcher,
+    isReady: () => requestSocket.isConnected() && (responseSocket?.isConnected() ?? false),
+    stop: () => {
+      clearInterval(heartbeatTimer);
+      stopResponseSocket();
+      requestSocket.stop();
+    },
+  };
+}
 
 async function main() {
   let cli;
@@ -68,96 +135,56 @@ async function main() {
     process.exit(1);
   }
 
-  // Do NOT exit on lock contention here: the MCP stdio handshake below must
-  // always succeed, even when another live instance already owns the plugin
-  // sockets. Claude Code/Cowork's shared MCP pool spins up a disposable
-  // sibling process just to negotiate protocol version before handing off to
-  // the real session; if that sibling hits process.exit(1) before
-  // server.connect(transport), the pool sees the connection close mid
-  // handshake and can never load this server's tools (even though the "real"
-  // instance is running fine). So on conflict, skip owning the plugin sockets
-  // and surface the conflict through isReady()/notReadyMessage instead.
-  let lockConflictMessage: string | null = null;
-  try {
-    acquireInstanceLock(REQUEST_PORT, RESPONSE_PORT);
-  } catch (err) {
-    lockConflictMessage = (err as Error).message;
-    console.error(lockConflictMessage);
-  }
-
   ensurePluginInstalled(here, (m) => console.error(m));
 
-  let requestSocket: PluginSocket;
-  let responseSocket: PluginSocket | null = null;
-  let responseConnectTimer: NodeJS.Timeout | null = null;
-  const dispatcher = new Dispatcher({
-    send: (line) => requestSocket.send(line),
-    getToken: () => readToken(),
-    timeoutMs: REQUEST_TIMEOUT_MS,
-    actionTimeoutsMs: ACTION_TIMEOUTS_MS,
+  // Do NOT block the MCP stdio handshake below on resolving a role: Claude
+  // Code/Cowork's shared MCP pool spins up a disposable sibling process just
+  // to negotiate protocol version before handing off to the real session; if
+  // that sibling stalls here (e.g. waiting out an IPC handshake timeout
+  // against a live primary) it can miss the pool's own handshake window even
+  // though the "real" instance ends up running fine. So role resolution runs
+  // in the background: the coordinator starts out not-ready with a generic
+  // "starting" message, `server.connect(transport)` proceeds immediately
+  // either way, and tool calls made before a role resolves see that message
+  // via isReady()/notReadyMessage() -- same shape as the old hard lock
+  // conflict, but no longer permanent: the coordinator keeps resolving (and,
+  // if this process ends up primary or the primary it attaches to dies,
+  // re-resolving) for the lifetime of the process instead of failing once
+  // and staying dead.
+  const coordinator = new BridgeCoordinator({
+    requestPort: REQUEST_PORT,
+    responsePort: RESPONSE_PORT,
+    log: (m) => console.error(m),
+    startPrimary: () => startPrimaryHandles(REQUEST_PORT, RESPONSE_PORT),
   });
-  const startResponseSocket = () => {
-    if (responseSocket || !requestSocket.isConnected()) return;
-    responseSocket = new PluginSocket({
-      port: RESPONSE_PORT,
-      label: "response",
-      onLine: (line) => dispatcher.handleResponseLine(line),
-    });
-    responseSocket.connect();
-  };
-  const stopResponseSocket = () => {
-    if (responseConnectTimer) {
-      clearTimeout(responseConnectTimer);
-      responseConnectTimer = null;
-    }
-    responseSocket?.stop();
-    responseSocket = null;
-  };
-  requestSocket = new PluginSocket({
-    port: REQUEST_PORT,
-    label: "request",
-    onConnect: () => {
-      if (responseConnectTimer) clearTimeout(responseConnectTimer);
-      responseConnectTimer = setTimeout(() => {
-        responseConnectTimer = null;
-        startResponseSocket();
-      }, RESPONSE_CONNECT_SETTLE_MS);
-    },
-    onDisconnect: () => {
-      stopResponseSocket();
-    },
+  coordinator.start().catch((err: Error) => {
+    console.error(`[bridge] failed to resolve a role: ${err.message}`);
   });
-  if (lockConflictMessage === null) {
-    requestSocket.connect();
-    startHeartbeat(dispatcher, HEARTBEAT_INTERVAL_MS);
-  }
 
   const server = createMcpServer({
-    dispatcher,
-    isReady: () =>
-      lockConflictMessage === null &&
-      requestSocket.isConnected() &&
-      (responseSocket?.isConnected() ?? false),
-    notReadyMessage:
-      lockConflictMessage !== null ? () => lockConflictMessage as string : undefined,
+    dispatcher: coordinator.dispatcher,
+    isReady: () => coordinator.isReady(),
+    notReadyMessage: () => coordinator.notReadyMessage(),
   });
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
   // Exit when the MCP client goes away. Signal handlers never fire when the
-  // parent dies without signaling (typical on Windows), and the live plugin
-  // sockets plus the heartbeat interval keep the event loop alive — the
-  // orphaned bridge then holds both the single-client plugin connection and
-  // the instance lock, so every future bridge instance fails with "Another
-  // Lightroom MCP bridge is already running". Stdin EOF is the one reliable
+  // parent dies without signaling (typical on Windows), and a live primary's
+  // plugin sockets, heartbeat, and IPC listener (or a live secondary's
+  // status-poll timer) keep the event loop alive -- the orphaned bridge
+  // would otherwise hold the plugin connection (if primary) or a stale IPC
+  // attachment (if secondary) forever. Stdin EOF is the one reliable
   // cross-platform signal that the client is gone.
   const exitOnClientGone = (reason: string) => () => {
     console.error(`Shutting down: ${reason}`);
+    coordinator.stop();
     process.exit(0);
   };
   process.stdin.once("end", exitOnClientGone("stdin ended (client exited)"));
   process.stdin.once("close", exitOnClientGone("stdin closed (client exited)"));
+  process.once("exit", () => coordinator.stop());
 
   console.error(`Lightroom MCP server v${VERSION} running on stdio`);
   console.error(`Connecting to plugin: request :${REQUEST_PORT}, response :${RESPONSE_PORT}`);

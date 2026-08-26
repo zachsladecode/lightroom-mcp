@@ -1,12 +1,21 @@
 import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import { defaultBaseDir, lockFilePath } from "./bridge-paths.js";
 
 export interface InstanceLock {
   release: () => void;
 }
 
-function pidIsAlive(pid: number): boolean {
+/**
+ * True if `pid` names a live process. EPERM (no permission to signal it, but
+ * it exists) counts as alive. This is a weaker check than it looks: it only
+ * proves *some* process holds that pid right now, not that it's the same
+ * process that created the lock (pids get reused) or that it's actually
+ * responsive (a wedged process still answers kill(pid, 0)). Exported so
+ * bridge-coordinator.ts can layer a real liveness check (a heartbeat file
+ * plus an IPC handshake) on top instead of trusting this alone -- see its
+ * module doc comment for why that matters.
+ */
+export function isPidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
@@ -15,9 +24,10 @@ function pidIsAlive(pid: number): boolean {
   }
 }
 
-function readPid(pidFile: string): number | null {
+/** Reads the pid recorded in a lock file, or null if it's missing/malformed. */
+export function readLockPid(lockFile: string): number | null {
   try {
-    const raw = fs.readFileSync(pidFile, "utf8").trim();
+    const raw = fs.readFileSync(lockFile, "utf8").trim();
     const parsed = Number(raw);
     return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
   } catch {
@@ -28,10 +38,10 @@ function readPid(pidFile: string): number | null {
 export function acquireInstanceLock(
   requestPort: number,
   responsePort: number,
-  baseDir = path.join(os.homedir(), ".config", "lightroom-mcp"),
+  baseDir = defaultBaseDir(),
 ): InstanceLock {
   fs.mkdirSync(baseDir, { recursive: true, mode: 0o700 });
-  const lockFile = path.join(baseDir, `bridge-${requestPort}-${responsePort}.lock`);
+  const lockFile = lockFilePath(baseDir, requestPort, responsePort);
 
   while (true) {
     let fd: number | null = null;
@@ -45,8 +55,8 @@ export function acquireInstanceLock(
         throw err;
       }
 
-      const existingPid = readPid(lockFile);
-      if (existingPid && pidIsAlive(existingPid)) {
+      const existingPid = readLockPid(lockFile);
+      if (existingPid && isPidAlive(existingPid)) {
         throw new Error(
           `Another Lightroom MCP bridge is already running for ports ${requestPort}/${responsePort} (pid ${existingPid})`,
         );
@@ -74,7 +84,7 @@ export function acquireInstanceLock(
     process.off("exit", exitHandler);
     process.off("SIGINT", signalHandler);
     process.off("SIGTERM", signalHandler);
-    if (readPid(lockFile) === process.pid) {
+    if (readLockPid(lockFile) === process.pid) {
       fs.unlinkSync(lockFile);
     }
   };
